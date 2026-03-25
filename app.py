@@ -84,27 +84,38 @@ HEADERS_RAE = {
 }
 
 def consultar_rae(palabra):
-    url = f"https://dle.rae.es/{requests.utils.quote(palabra.lower())}"
-    out = {"definiciones": [], "sinonimos_rae": [], "url": url, "error": None}
-    try:
-        res = requests.get(url, headers=HEADERS_RAE, timeout=10)
-        if res.status_code == 404:
-            out["error"] = f'"{palabra}" no está en el DLE de la RAE.'
-            return out
-        if res.status_code == 403:
-            out["error"] = "La RAE rechazó la consulta. Intenta de nuevo en unos segundos."
-            return out
-        if res.status_code != 200:
-            out["error"] = f"Error HTTP {res.status_code}."
-            return out
+    """
+    Consulta el DLE usando el endpoint /srv/search que devuelve
+    JSON con el HTML de cada entrada — más fiable que scraping directo.
+    Fallback: scraping HTML con selectores amplios.
+    """
+    url_vista = f"https://dle.rae.es/{requests.utils.quote(palabra.lower())}"
+    out = {"definiciones": [], "sinonimos_rae": [], "url": url_vista, "error": None}
 
-        soup     = BeautifulSoup(res.text, "html.parser")
-        articulo = soup.find("article")
-        if not articulo:
-            out["error"] = "La RAE no devolvió resultados. Intenta de nuevo."
-            return out
+    def extraer_defs(soup_obj):
+        """Extrae definiciones de un objeto BeautifulSoup con múltiples selectores."""
+        defs = []
+        sins = set()
 
-        for p in articulo.find_all("p", class_=re.compile(r"^j")):
+        # Selector 1: clases j, j1, j2, j3... (formato clásico del DLE)
+        parrafos = soup_obj.find_all("p", class_=re.compile(r"^j\d*$"))
+
+        # Selector 2: si no hay, buscar clases l2, m, n2 (formato alternativo)
+        if not parrafos:
+            parrafos = soup_obj.find_all("p", class_=re.compile(r"^(l2|m|n2|k5|k6)$"))
+
+        # Selector 3: cualquier <p> dentro de <article> que tenga span.n_acep
+        if not parrafos:
+            parrafos = [p for p in soup_obj.find_all("p")
+                        if p.find("span", class_="n_acep") or p.find("abbr")]
+
+        # Selector 4: todos los <p> del artículo con texto sustancial
+        if not parrafos:
+            parrafos = [p for p in soup_obj.find_all("p")
+                        if len(p.get_text(strip=True)) > 15]
+
+        num_global = 0
+        for p in parrafos:
             num_tag = p.find("span", class_="n_acep")
             num     = num_tag.get_text(strip=True) if num_tag else ""
             cat     = " ".join(
@@ -113,24 +124,81 @@ def consultar_rae(palabra):
             texto = p.get_text(separator=" ", strip=True)
             if num and texto.startswith(num):
                 texto = texto[len(num):].strip()
-            if texto:
-                out["definiciones"].append({"num": num, "categoria": cat, "texto": texto})
+            # Descartar líneas muy cortas o que son solo navegación
+            if texto and len(texto) > 10:
+                num_global += 1
+                defs.append({
+                    "num"      : num or str(num_global),
+                    "categoria": cat,
+                    "texto"    : texto
+                })
 
-        sins = set()
-        for tag in articulo.find_all(class_="sin"):
+        # Sinónimos
+        for tag in soup_obj.find_all(class_="sin"):
             for s in re.split(r"[,;]", tag.get_text()):
                 s = s.strip().lower()
                 if s and 1 < len(s) < 40:
                     sins.add(s)
-        out["sinonimos_rae"] = sorted(sins)
+
+        return defs, sorted(sins)
+
+    try:
+        # ── Intento 1: endpoint JSON /srv/search ──────────
+        url_json = (
+            f"https://dle.rae.es/srv/search"
+            f"?w={requests.utils.quote(palabra.lower())}&m=30&f=1"
+        )
+        r = requests.get(url_json, headers=HEADERS_RAE, timeout=10)
+
+        if r.status_code == 200:
+            try:
+                data = r.json()
+                res  = data.get("res", [])
+                if res:
+                    soup_total = BeautifulSoup("", "html.parser")
+                    for entrada in res:
+                        html_body = entrada.get("body", "") or entrada.get("html", "")
+                        if html_body:
+                            soup_total.append(BeautifulSoup(html_body, "html.parser"))
+                    defs, sins = extraer_defs(soup_total)
+                    if defs:
+                        out["definiciones"]  = defs
+                        out["sinonimos_rae"] = sins
+                        return out
+            except ValueError:
+                pass  # No era JSON, continuar con fallback
+
+        # ── Intento 2: scraping HTML directo ─────────────
+        r2 = requests.get(url_vista, headers=HEADERS_RAE, timeout=10)
+
+        if r2.status_code == 404:
+            out["error"] = f'"{palabra}" no está en el DLE de la RAE.'
+            return out
+        if r2.status_code == 403:
+            out["error"] = "La RAE bloqueó la consulta (403). Intenta en unos segundos."
+            return out
+        if r2.status_code != 200:
+            out["error"] = f"Error HTTP {r2.status_code}."
+            return out
+
+        soup     = BeautifulSoup(r2.text, "html.parser")
+        articulo = soup.find("article")
+        if not articulo:
+            out["error"] = "La RAE no devolvió el artículo. Intenta de nuevo."
+            return out
+
+        defs, sins = extraer_defs(articulo)
+        out["definiciones"]  = defs
+        out["sinonimos_rae"] = sins
 
         if not out["definiciones"]:
-            out["error"] = f'Sin definiciones para "{palabra}" en la RAE.'
+            out["error"] = f'No se encontraron definiciones para "{palabra}" en la RAE.'
 
     except requests.exceptions.Timeout:
         out["error"] = "La RAE tardó demasiado. Intenta de nuevo."
     except Exception as e:
-        out["error"] = f"Error: {e}"
+        out["error"] = f"Error inesperado: {e}"
+
     return out
 
 # ── Groq: SOLO presenta la info real, NO inventa ─────────
